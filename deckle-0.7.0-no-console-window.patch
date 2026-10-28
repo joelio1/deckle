@@ -1,0 +1,201 @@
+diff -ruN orig/.github/workflows/windows-build.yml deckle-0.7.0/.github/workflows/windows-build.yml
+--- orig/.github/workflows/windows-build.yml	1970-01-01 00:00:00.000000000 +0000
++++ deckle-0.7.0/.github/workflows/windows-build.yml	2026-10-28 00:39:28.493574282 +0000
+@@ -0,0 +1,56 @@
++name: windows-build
++# Windows-only, unsigned build of the installer. Run it by hand: Actions tab -> windows-build -> Run workflow.
++# The installer is kept as a workflow artifact for 14 days; no release is created.
++on:
++  workflow_dispatch:
++
++jobs:
++  windows:
++    runs-on: windows-latest
++    steps:
++      - uses: actions/checkout@v4
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: x86_64-pc-windows-msvc
++      - uses: Swatinem/rust-cache@v2
++        with:
++          key: x86_64-pc-windows-msvc
++      - uses: pnpm/action-setup@v4
++        with:
++          version: 12.5.1
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++          cache: pnpm
++          cache-dependency-path: apps/desktop/pnpm-lock.yaml
++      - run: pnpm install --frozen-lockfile
++        working-directory: apps/desktop
++      - name: Updater signing key present
++        shell: bash
++        env:
++          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
++        run: |
++          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
++            echo "::error::Add the TAURI_SIGNING_PRIVATE_KEY repository secret (see the instructions)."
++            exit 1
++          fi
++      - name: PDFium
++        shell: bash
++        run: |
++          set -euo pipefail
++          tools/fetch-pdfium.sh win-x64
++          mkdir -p apps/desktop/src-tauri/pdfium
++          cp target/pdfium/bin/pdfium.dll apps/desktop/src-tauri/pdfium/
++          rm -rf target/pdfium
++      - name: Build installer
++        working-directory: apps/desktop
++        shell: bash
++        env:
++          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
++          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
++        run: pnpm tauri build --target x86_64-pc-windows-msvc --config src-tauri/pdfium.windows.conf.json
++      - uses: actions/upload-artifact@v4
++        with:
++          name: deckle-windows-installer
++          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
++          retention-days: 14
+diff -ruN orig/apps/desktop/src-tauri/src/daily.rs deckle-0.7.0/apps/desktop/src-tauri/src/daily.rs
+--- orig/apps/desktop/src-tauri/src/daily.rs	2026-10-28 00:37:49.856632835 +0000
++++ deckle-0.7.0/apps/desktop/src-tauri/src/daily.rs	2026-10-28 00:37:49.928470543 +0000
+@@ -632,7 +632,10 @@
+     std::fs::create_dir_all(&preview).map_err(|e| e.to_string())?;
+     let args = run_args(send, &preview, paper.as_deref());
+     std::thread::spawn(move || {
+-        let result = match std::process::Command::new(&exe).args(&args).output() {
++        let result = match {
++            use deckle_core::proc::NoWindow;
++            std::process::Command::new(&exe).args(&args).no_window().output()
++        } {
+             Ok(out) => parse_run(out.status.success(), &out.stdout, &out.stderr),
+             Err(e) => RunResult {
+                 ok: false,
+diff -ruN orig/apps/desktop/src-tauri/src/morgue.rs deckle-0.7.0/apps/desktop/src-tauri/src/morgue.rs
+--- orig/apps/desktop/src-tauri/src/morgue.rs	2026-10-28 00:37:49.856692122 +0000
++++ deckle-0.7.0/apps/desktop/src-tauri/src/morgue.rs	2026-10-28 00:37:49.928684634 +0000
+@@ -128,8 +128,10 @@
+     date_of(&date)?;
+     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+     tauri::async_runtime::spawn_blocking(move || {
++        use deckle_core::proc::NoWindow;
+         let out = std::process::Command::new(&exe)
+             .args(["digest", "--json", "morgue", "send", &date])
++            .no_window()
+             .output()
+             .map_err(|e| format!("couldn't start {}: {e}", exe.display()))?;
+         parse_send(out.status.success(), &out.stdout, &out.stderr)
+diff -ruN orig/crates/deckle-core/src/lib.rs deckle-0.7.0/crates/deckle-core/src/lib.rs
+--- orig/crates/deckle-core/src/lib.rs	2026-10-28 00:37:49.859470654 +0000
++++ deckle-0.7.0/crates/deckle-core/src/lib.rs	2026-10-28 00:37:49.925963851 +0000
+@@ -25,6 +25,7 @@
+ pub mod preflight;
+ pub mod preset;
+ pub mod previewer;
++pub mod proc;
+ pub mod queue;
+ pub mod reader;
+ pub mod remarkable;
+diff -ruN orig/crates/deckle-core/src/previewer.rs deckle-0.7.0/crates/deckle-core/src/previewer.rs
+--- orig/crates/deckle-core/src/previewer.rs	2026-10-28 00:37:49.859573376 +0000
++++ deckle-0.7.0/crates/deckle-core/src/previewer.rs	2026-10-28 00:37:49.927074599 +0000
+@@ -7,6 +7,8 @@
+ 
+ use serde::Serialize;
+ 
++use crate::proc::NoWindow;
++
+ pub const PREVIEWER_DOWNLOAD_URL: &str = "https://kdp.amazon.com/en_US/help/topic/G202131170";
+ 
+ #[derive(Clone, Debug, Serialize)]
+@@ -196,7 +198,7 @@
+ }
+ 
+ fn probe_version(path: &Path) -> std::io::Result<String> {
+-    let o = Command::new(path).arg("--help").output()?;
++    let o = Command::new(path).arg("--help").no_window().output()?;
+     let text = format!(
+         "{}{}",
+         String::from_utf8_lossy(&o.stdout),
+@@ -224,6 +226,7 @@
+     let out_dir = std::path::absolute(out_dir)?;
+     let started = Instant::now();
+     let mut cmd = Command::new(&p.path);
++    cmd.no_window();
+     cmd.arg(&epub);
+     if p.major >= 4 {
+         cmd.args(["--convert", "--locale", "en", "--output"])
+diff -ruN orig/crates/deckle-core/src/proc.rs deckle-0.7.0/crates/deckle-core/src/proc.rs
+--- orig/crates/deckle-core/src/proc.rs	1970-01-01 00:00:00.000000000 +0000
++++ deckle-0.7.0/crates/deckle-core/src/proc.rs	2026-10-28 00:37:49.876759987 +0000
+@@ -0,0 +1,28 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! Child processes without a console window.
++//!
++//! Deckle's desktop app is a windowless GUI program. On Windows, when such a program starts a
++//! console program (`powershell`, `schtasks`, Kindle Previewer's command line) the system opens
++//! a new console window for it unless `CREATE_NO_WINDOW` is passed. Call [`NoWindow::no_window`]
++//! on every `Command` before running it. It does nothing on macOS and Linux.
++
++use std::process::Command;
++
++pub trait NoWindow {
++    /// Keeps the child from opening a console window (Windows only).
++    fn no_window(&mut self) -> &mut Self;
++}
++
++impl NoWindow for Command {
++    #[cfg(windows)]
++    fn no_window(&mut self) -> &mut Self {
++        use std::os::windows::process::CommandExt;
++        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
++        self.creation_flags(CREATE_NO_WINDOW)
++    }
++
++    #[cfg(not(windows))]
++    fn no_window(&mut self) -> &mut Self {
++        self
++    }
++}
+diff -ruN orig/crates/deckle-core/src/usb_serial.rs deckle-0.7.0/crates/deckle-core/src/usb_serial.rs
+--- orig/crates/deckle-core/src/usb_serial.rs	2026-10-28 00:37:49.859677929 +0000
++++ deckle-0.7.0/crates/deckle-core/src/usb_serial.rs	2026-10-28 00:37:49.927464556 +0000
+@@ -7,6 +7,8 @@
+ use std::path::Path;
+ use std::process::Command;
+ 
++use crate::proc::NoWindow;
++
+ /// The USB serial of the device `root` (a mounted volume) is on, when the OS will say.
+ pub fn serial_for_mount(root: &Path) -> Option<String> {
+     #[cfg(target_os = "macos")]
+@@ -51,7 +53,7 @@
+ 
+ #[allow(dead_code)]
+ fn run(program: &str, args: &[&str]) -> Option<String> {
+-    let out = Command::new(program).args(args).output().ok()?;
++    let out = Command::new(program).args(args).no_window().output().ok()?;
+     out.status
+         .success()
+         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+diff -ruN orig/crates/deckle-digest/src/schedule.rs deckle-0.7.0/crates/deckle-digest/src/schedule.rs
+--- orig/crates/deckle-digest/src/schedule.rs	2026-10-28 00:37:49.863411212 +0000
++++ deckle-0.7.0/crates/deckle-digest/src/schedule.rs	2026-10-28 00:37:49.928093880 +0000
+@@ -13,6 +13,7 @@
+ use crate::config::{Config, Day};
+ use crate::esc;
+ use crate::papers::MAIN;
++use deckle_core::proc::NoWindow;
+ 
+ pub const DIGEST_LABEL: &str = "com.casavargas.deckle.digest";
+ pub const WATCH_LABEL: &str = "com.casavargas.deckle.watch";
+@@ -295,6 +296,7 @@
+ }
+ 
+ fn run(cmd: &mut Command) -> Result<String, String> {
++    cmd.no_window();
+     let out = cmd
+         .output()
+         .map_err(|e| format!("{:?}: {e}", cmd.get_program()))?;
